@@ -1248,6 +1248,36 @@ PHP_REDIS_API int cluster_map_keyspace(redisCluster *c) {
         if (mapped) break;
     } ZEND_HASH_FOREACH_END();
 
+    /* No seed answered.  When we are remapping, the nodes of the current map
+     * may still answer although every seed is gone.  Read their reply first:
+     * cluster_map_slots() frees these nodes. */
+    if (!mapped && zend_hash_num_elements(c->nodes) > 0) {
+        redisClusterNode *node;
+
+        if (slots) {
+            cluster_free_reply(slots, 1);
+            slots = NULL;
+        }
+
+        ZEND_HASH_FOREACH_PTR(c->nodes, node) {
+            if (node == NULL || redis_sock_server_open(node->sock) != SUCCESS) {
+                continue;
+            }
+            if ((slots = cluster_get_slots(node->sock)) != NULL) {
+                break;
+            }
+            /* As for a seed, never keep a socket a failed reply was read on */
+            redis_sock_disconnect(node->sock, 0, 1);
+        } ZEND_HASH_FOREACH_END();
+
+        if (slots) {
+            mapped = !cluster_map_slots(c, slots);
+            if (!mapped) {
+                memset(c->master, 0, sizeof(redisClusterNode*)*REDIS_CLUSTER_SLOTS);
+            }
+        }
+    }
+
     // Clean up slots reply if we got one
     if (slots) cluster_free_reply(slots, 1);
 

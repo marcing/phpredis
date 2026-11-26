@@ -2829,6 +2829,61 @@ class Redis_Cluster_Test extends Redis_Test {
         }
     }
 
+    public function testPipelineRefreshAfterReadFailureWithoutSeed() {
+        $class = $this->getRedisClusterClass();
+        if (!$this->minVersionCheck('7.0')) $this->markTestSkipped();
+
+        $cacheSlots = ini_get('redis.clusters.cache_slots');
+        ini_set('redis.clusters.cache_slots', 0);
+        $user = 'phpredis-pipeline-seedless-' . uniqid();
+        $pass = uniqid('secret-', true);
+        $masters = $this->redis->_masters();
+        $seed = $masters[0];
+        $restricted = null;
+        $key = '{pipe-seedless}control';
+        $list = '{pipe-seedless}list';
+        $this->redis->set($key, 'still-readable');
+        $this->redis->del($list);
+
+        try {
+            foreach ($masters as $master) {
+                $this->assertTrue($this->redis->acl(
+                    $master, 'SETUSER', $user, 'on', ">$pass", '~*', '+@all'
+                ));
+            }
+            /* One seed only, as when a single address is configured */
+            $restricted = new $class(
+                null, ["$seed[0]:$seed[1]"], 1, .25, false, [$user, $pass]
+            );
+
+            /* A read that times out makes the next pipeline remap */
+            $exception = null;
+            try {
+                $restricted->pipeline()->blpop([$list], 1)->exec();
+            } catch (RedisClusterException $e) {
+                $exception = $e;
+            }
+            $this->assertTrue($exception instanceof RedisClusterException);
+            $this->assertEquals(Redis::ATOMIC, $restricted->getMode());
+
+            /* The seed can no longer map the cluster, the other nodes still can */
+            $this->assertTrue($this->redis->acl($seed, 'SETUSER', $user, '-cluster'));
+            $this->assertEquals('still-readable', $restricted->get($key));
+            foreach ([1, 2] as $attempt) {
+                $this->assertEquals(
+                    ['still-readable'], $restricted->pipeline()->get($key)->exec()
+                );
+            }
+        } finally {
+            if ($restricted) $restricted->close();
+            ini_set('redis.clusters.cache_slots', $cacheSlots);
+            foreach ($masters as $master) {
+                $this->redis->acl($master, 'DELUSER', $user);
+            }
+            $this->redis->del($key, $list);
+        }
+    }
+
     public function testPipelineRefreshRejectsUncoveredSlot() {
         $class = $this->getRedisClusterClass();
         [$process, $pipes, $port] = $this->startMalformedReplyServer('partial-slots');
